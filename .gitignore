@@ -1,0 +1,6 @@
+.env
+uploads/
+node_modules/
+schema.sql
+.DS_Store
+package-json.lock
