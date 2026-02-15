@@ -26,7 +26,11 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(helmet()); // Security headers
-app.use(cors()); // Enable CORS
+app.use(
+  cors({
+    origin: "*",
+  }),
+); // Enable CORS
 app.use(morgan("combined")); // Logging
 app.use(express.json({ limit: "10mb" })); // JSON parser
 app.use(express.urlencoded({ extended: true }));
