@@ -1,34 +1,49 @@
-const express = require('express');
-const bcrypt = require('bcrypt');
-const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
-const { authenticateToken, authorize } = require('../middleware/auth');
-const multer = require('multer');
-const path = require('path');
+const express = require("express");
+const bcrypt = require("bcrypt");
+const { body, validationResult } = require("express-validator");
+const {
+  User,
+  Enrollment,
+  LearningSession,
+  CourseContent,
+  TestAttempt,
+  Test,
+  Notification,
+  sequelize,
+} = require("../models");
+const { Op } = require("sequelize");
+const { authenticateToken, authorize } = require("../middleware/auth");
+const { notifyCandidateStatus } = require("../config/notifications");
+const multer = require("multer");
+const path = require("path");
 
 const router = express.Router();
 
 // Configure multer for file uploads
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, 'uploads/');
+    cb(null, "uploads/");
   },
   filename: function (req, file, cb) {
-    cb(null, Date.now() + '-' + file.originalname);
-  }
+    cb(null, Date.now() + "-" + file.originalname);
+  },
 });
 
-const upload = multer({ 
+const upload = multer({
   storage: storage,
-  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10485760 }
+  limits: { fileSize: parseInt(process.env.MAX_FILE_SIZE) || 10485760 },
 });
 
 // ========== USER MANAGEMENT ==========
 
 // Get all users
-router.get('/users', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const result = await db.query(`
+router.get(
+  "/users",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const [users] = await sequelize.query(`
       SELECT u.id, u.email, u.full_name, u.role, u.archetype, u.is_active, u.created_at,
              s.full_name as supervisor_name,
              COUNT(DISTINCT e.id) as enrolled_courses,
@@ -41,23 +56,25 @@ router.get('/users', authenticateToken, authorize('admin'), async (req, res) => 
       GROUP BY u.id, s.full_name
       ORDER BY u.created_at DESC
     `);
-    
-    res.json({ users: result.rows });
-  } catch (error) {
-    console.error('Fetch users error:', error);
-    res.status(500).json({ error: 'Failed to fetch users' });
-  }
-});
+
+      res.json({ users });
+    } catch (error) {
+      console.error("Fetch users error:", error);
+      res.status(500).json({ error: "Failed to fetch users" });
+    }
+  },
+);
 
 // Create user (any role)
-router.post('/users', 
-  authenticateToken, 
-  authorize('admin'),
+router.post(
+  "/users",
+  authenticateToken,
+  authorize("admin"),
   [
-    body('email').isEmail().normalizeEmail(),
-    body('password').isLength({ min: 8 }),
-    body('full_name').trim().notEmpty(),
-    body('role').isIn(['candidate', 'learner', 'supervisor', 'admin'])
+    body("email").isEmail().normalizeEmail(),
+    body("password").isLength({ min: 8 }),
+    body("full_name").trim().notEmpty(),
+    body("role").isIn(["candidate", "learner", "supervisor", "admin"]),
   ],
   async (req, res) => {
     try {
@@ -66,89 +83,122 @@ router.post('/users',
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { email, password, full_name, role, archetype, supervisor_id } = req.body;
+      const { email, password, full_name, role, archetype, supervisor_id } =
+        req.body;
 
-      const existingUser = await db.query('SELECT id FROM users WHERE email = $1', [email]);
-      if (existingUser.rows.length > 0) {
-        return res.status(409).json({ error: 'Email already exists' });
+      const existingUser = await User.findOne({
+        where: { email },
+        attributes: ["id"],
+      });
+      if (existingUser) {
+        return res.status(409).json({ error: "Email already exists" });
       }
 
       const salt = await bcrypt.genSalt(10);
       const password_hash = await bcrypt.hash(password, salt);
 
-      const result = await db.query(
-        `INSERT INTO users (email, password_hash, full_name, role, archetype, supervisor_id)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, email, full_name, role, archetype, created_at`,
-        [email, password_hash, full_name, role, archetype || null, supervisor_id || null]
-      );
+      const user = await User.create({
+        email,
+        password_hash,
+        full_name,
+        role,
+        archetype: archetype || null,
+        supervisor_id: supervisor_id || null,
+      });
 
       res.status(201).json({
-        message: 'User created successfully',
-        user: result.rows[0]
+        message: "User created successfully",
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          role: user.role,
+          archetype: user.archetype,
+          created_at: user.created_at,
+        },
       });
     } catch (error) {
-      console.error('Create user error:', error);
-      res.status(500).json({ error: 'Failed to create user' });
+      console.error("Create user error:", error);
+      res.status(500).json({ error: "Failed to create user" });
     }
-  }
+  },
 );
 
 // Update user details
-router.put('/users/:userId', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { full_name, email, role, archetype, supervisor_id } = req.body;
+router.put(
+  "/users/:userId",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const { full_name, email, role, archetype, supervisor_id } = req.body;
 
-    const result = await db.query(
-      `UPDATE users 
-       SET full_name = COALESCE($1, full_name),
-           email = COALESCE($2, email),
-           role = COALESCE($3, role),
-           archetype = COALESCE($4, archetype),
-           supervisor_id = $5,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $6
-       RETURNING id, email, full_name, role, archetype, is_active`,
-      [full_name, email, role, archetype, supervisor_id, userId]
-    );
+      const user = await User.findByPk(userId);
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      await user.update({
+        full_name: full_name || user.full_name,
+        email: email || user.email,
+        role: role || user.role,
+        archetype: archetype || user.archetype,
+        supervisor_id: supervisor_id,
+      });
+
+      res.json({
+        message: "User updated successfully",
+        user: {
+          id: user.id,
+          email: user.email,
+          full_name: user.full_name,
+          role: user.role,
+          archetype: user.archetype,
+          is_active: user.is_active,
+        },
+      });
+    } catch (error) {
+      console.error("Update user error:", error);
+      res.status(500).json({ error: "Failed to update user" });
     }
-
-    res.json({ message: 'User updated successfully', user: result.rows[0] });
-  } catch (error) {
-    console.error('Update user error:', error);
-    res.status(500).json({ error: 'Failed to update user' });
-  }
-});
+  },
+);
 
 // Change username (email)
-router.put('/users/:userId/username', authenticateToken, authorize('admin'),
-  [body('new_email').isEmail().normalizeEmail()],
+router.put(
+  "/users/:userId/username",
+  authenticateToken,
+  authorize("admin"),
+  [body("new_email").isEmail().normalizeEmail()],
   async (req, res) => {
     try {
       const { userId } = req.params;
       const { new_email } = req.body;
 
-      const existing = await db.query('SELECT id FROM users WHERE email = $1 AND id != $2', [new_email, userId]);
-      if (existing.rows.length > 0) {
-        return res.status(409).json({ error: 'Email already in use' });
+      const existing = await User.findOne({
+        where: { email: new_email, id: { [Op.ne]: userId } },
+        attributes: ["id"],
+      });
+      if (existing) {
+        return res.status(409).json({ error: "Email already in use" });
       }
 
-      await db.query('UPDATE users SET email = $1 WHERE id = $2', [new_email, userId]);
-      res.json({ message: 'Username updated successfully' });
+      await User.update({ email: new_email }, { where: { id: userId } });
+      res.json({ message: "Username updated successfully" });
     } catch (error) {
-      console.error('Update username error:', error);
-      res.status(500).json({ error: 'Failed to update username' });
+      console.error("Update username error:", error);
+      res.status(500).json({ error: "Failed to update username" });
     }
-  }
+  },
 );
 
 // Change user password
-router.put('/users/:userId/password', authenticateToken, authorize('admin'),
-  [body('new_password').isLength({ min: 8 })],
+router.put(
+  "/users/:userId/password",
+  authenticateToken,
+  authorize("admin"),
+  [body("new_password").isLength({ min: 8 })],
   async (req, res) => {
     try {
       const { userId } = req.params;
@@ -157,177 +207,190 @@ router.put('/users/:userId/password', authenticateToken, authorize('admin'),
       const salt = await bcrypt.genSalt(10);
       const password_hash = await bcrypt.hash(new_password, salt);
 
-      await db.query('UPDATE users SET password_hash = $1 WHERE id = $2', [password_hash, userId]);
-      res.json({ message: 'Password changed successfully' });
+      await User.update({ password_hash }, { where: { id: userId } });
+      res.json({ message: "Password changed successfully" });
     } catch (error) {
-      console.error('Change password error:', error);
-      res.status(500).json({ error: 'Failed to change password' });
+      console.error("Change password error:", error);
+      res.status(500).json({ error: "Failed to change password" });
     }
-  }
+  },
 );
 
 // Suspend/Activate user
-router.put('/users/:userId/toggle-status', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const result = await db.query(
-      'UPDATE users SET is_active = NOT is_active WHERE id = $1 RETURNING is_active',
-      [userId]
-    );
-    res.json({
-      message: result.rows[0].is_active ? 'User activated' : 'User suspended',
-      is_active: result.rows[0].is_active
-    });
-  } catch (error) {
-    console.error('Toggle status error:', error);
-    res.status(500).json({ error: 'Failed to toggle status' });
-  }
-});
+router.put(
+  "/users/:userId/toggle-status",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      const user = await User.findByPk(userId);
+      await user.update({ is_active: !user.is_active });
+      res.json({
+        message: user.is_active ? "User activated" : "User suspended",
+        is_active: user.is_active,
+      });
+    } catch (error) {
+      console.error("Toggle status error:", error);
+      res.status(500).json({ error: "Failed to toggle status" });
+    }
+  },
+);
 
 // Delete user
-router.delete('/users/:userId', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { userId } = req.params;
-    await db.query('DELETE FROM users WHERE id = $1', [userId]);
-    res.json({ message: 'User deleted successfully' });
-  } catch (error) {
-    console.error('Delete user error:', error);
-    res.status(500).json({ error: 'Failed to delete user' });
-  }
-});
+router.delete(
+  "/users/:userId",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { userId } = req.params;
+      await User.destroy({ where: { id: userId } });
+      res.json({ message: "User deleted successfully" });
+    } catch (error) {
+      console.error("Delete user error:", error);
+      res.status(500).json({ error: "Failed to delete user" });
+    }
+  },
+);
+
 // Migrate candidate to learner
-router.post('/candidates/:candidateId/migrate', 
-  authenticateToken, 
-  authorize('admin'),
+router.post(
+  "/candidates/:candidateId/migrate",
+  authenticateToken,
+  authorize("admin"),
   [
-    body('new_role').isIn(['learner']),
-    body('supervisor_id').optional().isInt(),
-    body('archetype').optional().isString()
+    body("new_role").isIn(["learner"]),
+    body("supervisor_id").optional().isInt(),
+    body("archetype").optional().isString(),
   ],
   async (req, res) => {
-    const client = await db.pool.connect();
+    const t = await sequelize.transaction();
     try {
-      await client.query('BEGIN');
-
       const { candidateId } = req.params;
       const { new_role, supervisor_id, archetype } = req.body;
 
       // Verify candidate exists and has passing test
-      const candidate = await client.query(
+      const [candidates] = await sequelize.query(
         `SELECT u.*, ta.score, t.passing_score
          FROM users u
          LEFT JOIN test_attempts ta ON u.id = ta.user_id AND ta.status = 'graded'
          LEFT JOIN tests t ON ta.test_id = t.id
-         WHERE u.id = $1 AND u.role = 'candidate'
+         WHERE u.id = :candidateId AND u.role = 'candidate'
          ORDER BY ta.score DESC NULLS LAST
          LIMIT 1`,
-        [candidateId]
+        { replacements: { candidateId }, transaction: t },
       );
 
-      if (candidate.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Candidate not found' });
+      if (candidates.length === 0) {
+        await t.rollback();
+        return res.status(404).json({ error: "Candidate not found" });
       }
 
-      const user = candidate.rows[0];
-      const score = user.score;
-      const passingScore = user.passing_score || 70;
+      const candidate = candidates[0];
+      const score = candidate.score;
+      const passingScore = candidate.passing_score || 70;
 
       if (!score || score < passingScore) {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ 
-          error: 'Candidate has not passed the assessment',
+        await t.rollback();
+        return res.status(400).json({
+          error: "Candidate has not passed the assessment",
           score,
-          required: passingScore
+          required: passingScore,
         });
       }
 
       // Update user role
-      await client.query(
-        `UPDATE users 
-         SET role = $1, 
-             supervisor_id = $2,
-             archetype = COALESCE($3, archetype),
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4`,
-        [new_role, supervisor_id || null, archetype || null, candidateId]
+      await User.update(
+        {
+          role: new_role,
+          supervisor_id: supervisor_id || null,
+          archetype: archetype || candidate.archetype,
+        },
+        { where: { id: candidateId }, transaction: t },
       );
 
       // Log the migration
-      await client.query(
-        `INSERT INTO notifications (user_id, title, message, notification_type)
-         VALUES ($1, $2, $3, $4)`,
-        [
-          candidateId,
-          'Account Activated!',
-          `Congratulations! Your account has been upgraded to ${new_role}. You now have full access to the platform.`,
-          'account_migration'
-        ]
+      await Notification.create(
+        {
+          user_id: candidateId,
+          title: "Account Activated!",
+          message: `Congratulations! Your account has been upgraded to ${new_role}. You now have full access to the platform.`,
+          notification_type: "account_migration",
+        },
+        { transaction: t },
       );
 
-      await client.query('COMMIT');
+      await t.commit();
 
       // Send acceptance notification
-      await notifyCandidateStatus(user, 'accepted');
+      await notifyCandidateStatus(candidate, "accepted");
 
       res.json({
-        message: 'Candidate migrated successfully',
-        user: {
-          id: candidateId,
-          new_role,
-          supervisor_id,
-          archetype
-        }
+        message: "Candidate migrated successfully",
+        user: { id: candidateId, new_role, supervisor_id, archetype },
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Migration error:', error);
-      res.status(500).json({ error: 'Failed to migrate candidate' });
-    } finally {
-      client.release();
+      await t.rollback();
+      console.error("Migration error:", error);
+      res.status(500).json({ error: "Failed to migrate candidate" });
     }
-  }
+  },
 );
 
 // Get candidates eligible for migration
-router.get('/candidates/eligible', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const result = await db.query(
-      `SELECT u.id, u.email, u.full_name, u.created_at,
+router.get(
+  "/candidates/eligible",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const [candidates] = await sequelize.query(
+        `SELECT u.id, u.email, u.full_name, u.created_at,
               ta.score, ta.graded_at, t.passing_score, t.title as test_title
        FROM users u
        JOIN test_attempts ta ON u.id = ta.user_id AND ta.status = 'graded'
        JOIN tests t ON ta.test_id = t.id
        WHERE u.role = 'candidate' 
          AND ta.score >= t.passing_score
-       ORDER BY ta.graded_at DESC`
-    );
+       ORDER BY ta.graded_at DESC`,
+      );
 
-    res.json({ candidates: result.rows });
-  } catch (error) {
-    console.error('Fetch eligible candidates error:', error);
-    res.status(500).json({ error: 'Failed to fetch eligible candidates' });
-  }
-});
-//Get supervisor list for assignment.
-router.get('/supervisors', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const result = await db.query(
-      "SELECT id, name as full_name, email FROM users WHERE role = 'supervisor' AND is_active = true ORDER BY name"
-    );
-    res.json({ supervisors: result.rows });
-  } catch (error) {
-    console.error('Fetch supervisors error:', error);
-    res.status(500).json({ error: 'Failed to fetch supervisors' });
-  }
-});
+      res.json({ candidates });
+    } catch (error) {
+      console.error("Fetch eligible candidates error:", error);
+      res.status(500).json({ error: "Failed to fetch eligible candidates" });
+    }
+  },
+);
 
+// Get supervisor list for assignment
+router.get(
+  "/supervisors",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const supervisors = await User.findAll({
+        where: { role: "supervisor", is_active: true },
+        attributes: ["id", "full_name", "email"],
+        order: [["full_name", "ASC"]],
+      });
+
+      res.json({ supervisors });
+    } catch (error) {
+      console.error("Fetch supervisors error:", error);
+      res.status(500).json({ error: "Failed to fetch supervisors" });
+    }
+  },
+);
 
 // Upload course material
-router.post('/courses/:courseId/upload', 
-  authenticateToken, 
-  authorize('admin'),
-  upload.single('file'),
+router.post(
+  "/courses/:courseId/upload",
+  authenticateToken,
+  authorize("admin"),
+  upload.single("file"),
   async (req, res) => {
     try {
       const { courseId } = req.params;
@@ -335,95 +398,108 @@ router.post('/courses/:courseId/upload',
       const file = req.file;
 
       if (!file) {
-        return res.status(400).json({ error: 'No file uploaded' });
+        return res.status(400).json({ error: "No file uploaded" });
       }
 
       const content_url = `/uploads/${file.filename}`;
 
-      const orderResult = await db.query(
-        'SELECT COALESCE(MAX(order_index), -1) + 1 as next_order FROM course_content WHERE course_id = $1',
-        [courseId]
-      );
+      const maxOrder = await CourseContent.max("order_index", {
+        where: { course_id: courseId },
+      });
+      const nextOrder = (maxOrder ?? -1) + 1;
 
-      const result = await db.query(
-        `INSERT INTO course_content (course_id, title, content_type, content_url, order_index)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [courseId, title, content_type, content_url, orderResult.rows[0].next_order]
-      );
+      const content = await CourseContent.create({
+        course_id: courseId,
+        title,
+        content_type,
+        content_url,
+        order_index: nextOrder,
+      });
 
-      res.status(201).json({ message: 'Material uploaded successfully', content: result.rows[0] });
+      res
+        .status(201)
+        .json({ message: "Material uploaded successfully", content });
     } catch (error) {
-      console.error('Upload error:', error);
-      res.status(500).json({ error: 'Failed to upload material' });
+      console.error("Upload error:", error);
+      res.status(500).json({ error: "Failed to upload material" });
     }
-  }
+  },
 );
 
 // Add course content (link-based)
-router.post('/courses/:courseId/content', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { courseId } = req.params;
-    const { title, content_type, content_url } = req.body;
+router.post(
+  "/courses/:courseId/content",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { title, content_type, content_url } = req.body;
 
-    const orderResult = await db.query(
-      'SELECT COALESCE(MAX(order_index), -1) + 1 as next_order FROM course_content WHERE course_id = $1',
-      [courseId]
-    );
+      const maxOrder = await CourseContent.max("order_index", {
+        where: { course_id: courseId },
+      });
+      const nextOrder = (maxOrder ?? -1) + 1;
 
-    const result = await db.query(
-      `INSERT INTO course_content (course_id, title, content_type, content_url, order_index)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [courseId, title, content_type, content_url, orderResult.rows[0].next_order]
-    );
+      const content = await CourseContent.create({
+        course_id: courseId,
+        title,
+        content_type,
+        content_url,
+        order_index: nextOrder,
+      });
 
-    res.status(201).json({ message: 'Content added successfully', content: result.rows[0] });
-  } catch (error) {
-    console.error('Add content error:', error);
-    res.status(500).json({ error: 'Failed to add content' });
-  }
-});
+      res.status(201).json({ message: "Content added successfully", content });
+    } catch (error) {
+      console.error("Add content error:", error);
+      res.status(500).json({ error: "Failed to add content" });
+    }
+  },
+);
 
 // Update course content
-router.put('/content/:contentId', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { contentId } = req.params;
-    const { title, content_url } = req.body;
+router.put(
+  "/content/:contentId",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { contentId } = req.params;
+      const { title, content_url } = req.body;
 
-    const result = await db.query(
-      'UPDATE course_content SET title = COALESCE($1, title), content_url = COALESCE($2, content_url) WHERE id = $3 RETURNING *',
-      [title, content_url, contentId]
-    );
+      const content = await CourseContent.findByPk(contentId);
+      if (!content) {
+        return res.status(404).json({ error: "Content not found" });
+      }
 
-    res.json({ message: 'Content updated successfully', content: result.rows[0] });
-  } catch (error) {
-    console.error('Update content error:', error);
-    res.status(500).json({ error: 'Failed to update content' });
-  }
-});
+      await content.update({
+        title: title || content.title,
+        content_url: content_url || content.content_url,
+      });
+
+      res.json({ message: "Content updated successfully", content });
+    } catch (error) {
+      console.error("Update content error:", error);
+      res.status(500).json({ error: "Failed to update content" });
+    }
+  },
+);
 
 // Delete course content
-router.delete('/content/:contentId', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const { contentId } = req.params;
-    await db.query('DELETE FROM course_content WHERE id = $1', [contentId]);
-    res.json({ message: 'Content deleted successfully' });
-  } catch (error) {
-    console.error('Delete content error:', error);
-    res.status(500).json({ error: 'Failed to delete content' });
-  }
-});
-
-// Get supervisors list (for assigning)
-router.get('/supervisors', authenticateToken, authorize('admin'), async (req, res) => {
-  try {
-    const result = await db.query(
-      "SELECT id, full_name, email FROM users WHERE role = 'supervisor' AND is_active = true ORDER BY full_name"
-    );
-    res.json({ supervisors: result.rows });
-  } catch (error) {
-    console.error('Fetch supervisors error:', error);
-    res.status(500).json({ error: 'Failed to fetch supervisors' });
-  }
-});
+router.delete(
+  "/content/:contentId",
+  authenticateToken,
+  authorize("admin"),
+  async (req, res) => {
+    try {
+      const { contentId } = req.params;
+      await CourseContent.destroy({ where: { id: contentId } });
+      res.json({ message: "Content deleted successfully" });
+    } catch (error) {
+      console.error("Delete content error:", error);
+      res.status(500).json({ error: "Failed to delete content" });
+    }
+  },
+);
 
 module.exports = router;

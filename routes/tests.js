@@ -1,239 +1,276 @@
-const express = require('express');
-const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
-const { authenticateToken, authorize } = require('../middleware/auth');
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const {
+  sequelize,
+  Test,
+  TestQuestion,
+  QuestionOption,
+  TestAttempt,
+  TestAnswer,
+  Course,
+} = require("../models");
+const { authenticateToken, authorize } = require("../middleware/auth");
+const { QueryTypes } = require("sequelize");
 
 const router = express.Router();
 
 // Create test (Admin only)
-router.post('/',
+router.post(
+  "/",
   authenticateToken,
-  authorize('admin'),
+  authorize("admin"),
   [
-    body('course_id').isInt(),
-    body('title').trim().notEmpty(),
-    body('test_type').isIn(['multiple_choice', 'written', 'coding']),
-    body('questions').isArray({ min: 1 })
+    body("course_id").isInt(),
+    body("title").trim().notEmpty(),
+    body("test_type").isIn(["multiple_choice", "written", "coding"]),
+    body("questions").isArray({ min: 1 }),
   ],
   async (req, res) => {
-    const client = await db.pool.connect();
+    const t = await sequelize.transaction();
     try {
-      await client.query('BEGIN');
-
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
-        await client.query('ROLLBACK');
+        await t.rollback();
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { course_id, title, description, test_type, passing_score, time_limit_minutes, max_attempts, questions } = req.body;
+      const {
+        course_id,
+        title,
+        description,
+        test_type,
+        passing_score,
+        time_limit_minutes,
+        max_attempts,
+        questions,
+      } = req.body;
 
-      // Insert test
-      const testResult = await client.query(
-        `INSERT INTO tests (course_id, title, description, test_type, passing_score, time_limit_minutes, max_attempts, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         RETURNING *`,
-        [course_id, title, description || null, test_type, passing_score || 70, time_limit_minutes || null, max_attempts || 3, req.user.id]
+      const test = await Test.create(
+        {
+          course_id,
+          title,
+          description: description || null,
+          test_type,
+          passing_score: passing_score || 70,
+          time_limit_minutes: time_limit_minutes || null,
+          max_attempts: max_attempts || 3,
+          created_by: req.user.id,
+        },
+        { transaction: t },
       );
 
-      const test = testResult.rows[0];
-
-      // Insert questions
       for (let i = 0; i < questions.length; i++) {
         const q = questions[i];
-        const questionResult = await client.query(
-          `INSERT INTO test_questions (test_id, question_text, question_type, points, order_index)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id`,
-          [test.id, q.question_text, q.question_type || test_type, q.points || 1, i]
+        const question = await TestQuestion.create(
+          {
+            test_id: test.id,
+            question_text: q.question_text,
+            question_type: q.question_type || test_type,
+            points: q.points || 1,
+            order_index: i,
+          },
+          { transaction: t },
         );
 
-        const questionId = questionResult.rows[0].id;
-
-        // Insert options for MCQ
-        if ((q.question_type || test_type) === 'multiple_choice' && q.options) {
+        if ((q.question_type || test_type) === "multiple_choice" && q.options) {
           for (let j = 0; j < q.options.length; j++) {
             const opt = q.options[j];
-            await client.query(
-              `INSERT INTO question_options (question_id, option_text, is_correct, order_index)
-               VALUES ($1, $2, $3, $4)`,
-              [questionId, opt.option_text, opt.is_correct || false, j]
+            await QuestionOption.create(
+              {
+                question_id: question.id,
+                option_text: opt.option_text,
+                is_correct: opt.is_correct || false,
+                order_index: j,
+              },
+              { transaction: t },
             );
           }
         }
       }
 
-      await client.query('COMMIT');
+      await t.commit();
 
       res.status(201).json({
-        message: 'Test created successfully',
-        test
+        message: "Test created successfully",
+        test,
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Test creation error:', error);
-      res.status(500).json({ error: 'Failed to create test' });
-    } finally {
-      client.release();
+      await t.rollback();
+      console.error("Test creation error:", error);
+      res.status(500).json({ error: "Failed to create test" });
     }
-  }
+  },
 );
 
 // Get test details
-router.get('/:id', authenticateToken, async (req, res) => {
+router.get("/:id", authenticateToken, async (req, res) => {
   try {
     const testId = req.params.id;
 
-    const testResult = await db.query(
-      `SELECT t.*, c.title as course_title
-       FROM tests t
-       JOIN courses c ON t.course_id = c.id
-       WHERE t.id = $1`,
-      [testId]
-    );
+    const test = await Test.findByPk(testId, {
+      include: [{ model: Course, attributes: ["title"] }],
+    });
 
-    if (testResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Test not found' });
+    if (!test) {
+      return res.status(404).json({ error: "Test not found" });
     }
 
-    const test = testResult.rows[0];
+    const plain = test.get({ plain: true });
+    plain.course_title = plain.Course ? plain.Course.title : null;
+    delete plain.Course;
 
     // Get questions
-    const questionsResult = await db.query(
-      'SELECT * FROM test_questions WHERE test_id = $1 ORDER BY order_index',
-      [testId]
-    );
+    const questions = await TestQuestion.findAll({
+      where: { test_id: testId },
+      order: [["order_index", "ASC"]],
+    });
 
-    // Get options for each question
-    const questions = await Promise.all(questionsResult.rows.map(async (q) => {
-      if (q.question_type === 'multiple_choice') {
-        const optionsResult = await db.query(
-          'SELECT id, option_text, order_index FROM question_options WHERE question_id = $1 ORDER BY order_index',
-          [q.id]
-        );
-        q.options = optionsResult.rows;
-      }
-      return q;
-    }));
+    const questionsWithOptions = await Promise.all(
+      questions.map(async (q) => {
+        const qPlain = q.get({ plain: true });
+        if (qPlain.question_type === "multiple_choice") {
+          const options = await QuestionOption.findAll({
+            where: { question_id: qPlain.id },
+            attributes: ["id", "option_text", "order_index"],
+            order: [["order_index", "ASC"]],
+          });
+          qPlain.options = options.map((o) => o.get({ plain: true }));
+        }
+        return qPlain;
+      }),
+    );
 
     // Get user's attempts
-    const attemptsResult = await db.query(
-      'SELECT id, status, started_at, submitted_at, score, attempt_number FROM test_attempts WHERE test_id = $1 AND user_id = $2 ORDER BY attempt_number DESC',
-      [testId, req.user.id]
-    );
+    const attempts = await TestAttempt.findAll({
+      where: { test_id: testId, user_id: req.user.id },
+      attributes: [
+        "id",
+        "status",
+        "started_at",
+        "submitted_at",
+        "score",
+        "attempt_number",
+      ],
+      order: [["attempt_number", "DESC"]],
+    });
 
     res.json({
-      test,
-      questions,
-      attempts: attemptsResult.rows,
-      attempts_remaining: Math.max(0, (test.max_attempts || 3) - attemptsResult.rows.length)
+      test: plain,
+      questions: questionsWithOptions,
+      attempts: attempts.map((a) => a.get({ plain: true })),
+      attempts_remaining: Math.max(
+        0,
+        (plain.max_attempts || 3) - attempts.length,
+      ),
     });
   } catch (error) {
-    console.error('Test fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch test' });
+    console.error("Test fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch test" });
   }
 });
 
 // Start test attempt
-router.post('/:id/start', authenticateToken, authorize('learner', 'candidate'), async (req, res) => {
-  try {
-    const testId = req.params.id;
+router.post(
+  "/:id/start",
+  authenticateToken,
+  authorize("learner", "candidate"),
+  async (req, res) => {
+    try {
+      const testId = req.params.id;
 
-    // Get test info
-    const testResult = await db.query('SELECT max_attempts FROM tests WHERE id = $1', [testId]);
-    if (testResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Test not found' });
+      const test = await Test.findByPk(testId, {
+        attributes: ["id", "max_attempts"],
+      });
+      if (!test) {
+        return res.status(404).json({ error: "Test not found" });
+      }
+
+      const maxAttempts = test.max_attempts || 3;
+      const attemptCount = await TestAttempt.count({
+        where: { test_id: testId, user_id: req.user.id },
+      });
+
+      if (attemptCount >= maxAttempts) {
+        return res.status(400).json({ error: "Maximum attempts reached" });
+      }
+
+      const attempt = await TestAttempt.create({
+        test_id: testId,
+        user_id: req.user.id,
+        status: "in_progress",
+        attempt_number: attemptCount + 1,
+      });
+
+      res.status(201).json({
+        message: "Test attempt started",
+        attempt,
+      });
+    } catch (error) {
+      console.error("Test start error:", error);
+      res.status(500).json({ error: "Failed to start test" });
     }
-
-    const maxAttempts = testResult.rows[0].max_attempts || 3;
-
-    // Check attempts count
-    const attemptsResult = await db.query(
-      'SELECT COUNT(*) as count FROM test_attempts WHERE test_id = $1 AND user_id = $2',
-      [testId, req.user.id]
-    );
-
-    if (parseInt(attemptsResult.rows[0].count) >= maxAttempts) {
-      return res.status(400).json({ error: 'Maximum attempts reached' });
-    }
-
-    // Create attempt
-    const attemptNumber = parseInt(attemptsResult.rows[0].count) + 1;
-    const result = await db.query(
-      `INSERT INTO test_attempts (test_id, user_id, status, attempt_number)
-       VALUES ($1, $2, 'in_progress', $3)
-       RETURNING *`,
-      [testId, req.user.id, attemptNumber]
-    );
-
-    res.status(201).json({
-      message: 'Test attempt started',
-      attempt: result.rows[0]
-    });
-  } catch (error) {
-    console.error('Test start error:', error);
-    res.status(500).json({ error: 'Failed to start test' });
-  }
-});
+  },
+);
 
 // Submit test answers
-router.post('/attempts/:attemptId/submit',
+router.post(
+  "/attempts/:attemptId/submit",
   authenticateToken,
-  authorize('learner', 'candidate'),
-  [body('answers').isArray({ min: 1 })],
+  authorize("learner", "candidate"),
+  [body("answers").isArray({ min: 1 })],
   async (req, res) => {
-    const client = await db.pool.connect();
+    const t = await sequelize.transaction();
     try {
-      await client.query('BEGIN');
-
       const attemptId = req.params.attemptId;
       const { answers } = req.body;
 
-      // Verify attempt belongs to user
-      const attemptResult = await client.query(
-        'SELECT id, test_id, status FROM test_attempts WHERE id = $1 AND user_id = $2',
-        [attemptId, req.user.id]
-      );
+      const attempt = await TestAttempt.findOne({
+        where: { id: attemptId, user_id: req.user.id },
+        attributes: ["id", "test_id", "status"],
+        transaction: t,
+      });
 
-      if (attemptResult.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Attempt not found' });
+      if (!attempt) {
+        await t.rollback();
+        return res.status(404).json({ error: "Attempt not found" });
       }
 
-      if (attemptResult.rows[0].status !== 'in_progress') {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Test already submitted' });
+      if (attempt.status !== "in_progress") {
+        await t.rollback();
+        return res.status(400).json({ error: "Test already submitted" });
       }
 
-      const testId = attemptResult.rows[0].test_id;
+      const test = await Test.findByPk(attempt.test_id, {
+        attributes: ["test_type"],
+        transaction: t,
+      });
+      const testType = test.test_type;
 
-      // Get test type
-      const testResult = await client.query('SELECT test_type FROM tests WHERE id = $1', [testId]);
-      const testType = testResult.rows[0].test_type;
-
-      // Insert answers and auto-grade MCQs
       let totalPoints = 0;
       let earnedPoints = 0;
 
       for (const answer of answers) {
-        const questionResult = await client.query(
-          'SELECT points, question_type FROM test_questions WHERE id = $1',
-          [answer.question_id]
-        );
+        const question = await TestQuestion.findByPk(answer.question_id, {
+          attributes: ["points", "question_type"],
+          transaction: t,
+        });
 
-        const question = questionResult.rows[0];
         totalPoints += question.points;
-
         let pointsAwarded = null;
 
-        // Auto-grade MCQ
-        if (question.question_type === 'multiple_choice' && answer.selected_option_id) {
-          const optionResult = await client.query(
-            'SELECT is_correct FROM question_options WHERE id = $1',
-            [answer.selected_option_id]
+        if (
+          question.question_type === "multiple_choice" &&
+          answer.selected_option_id
+        ) {
+          const option = await QuestionOption.findByPk(
+            answer.selected_option_id,
+            {
+              attributes: ["is_correct"],
+              transaction: t,
+            },
           );
 
-          if (optionResult.rows.length > 0 && optionResult.rows[0].is_correct) {
+          if (option && option.is_correct) {
             pointsAwarded = question.points;
             earnedPoints += pointsAwarded;
           } else {
@@ -241,131 +278,138 @@ router.post('/attempts/:attemptId/submit',
           }
         }
 
-        await client.query(
-          `INSERT INTO test_answers (attempt_id, question_id, answer_text, selected_option_id, points_awarded)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [attemptId, answer.question_id, answer.answer_text || null, answer.selected_option_id || null, pointsAwarded]
+        await TestAnswer.create(
+          {
+            attempt_id: attemptId,
+            question_id: answer.question_id,
+            answer_text: answer.answer_text || null,
+            selected_option_id: answer.selected_option_id || null,
+            points_awarded: pointsAwarded,
+          },
+          { transaction: t },
         );
       }
 
-      // Update attempt
-      const score = testType === 'multiple_choice' ? (earnedPoints / totalPoints * 100).toFixed(2) : null;
+      const score =
+        testType === "multiple_choice"
+          ? ((earnedPoints / totalPoints) * 100).toFixed(2)
+          : null;
 
-      await client.query(
-        `UPDATE test_attempts 
-         SET status = 'submitted', 
-             submitted_at = CURRENT_TIMESTAMP,
-             score = $1,
-             graded_at = CASE WHEN $2 = 'multiple_choice' THEN CURRENT_TIMESTAMP ELSE NULL END
-         WHERE id = $3`,
-        [score, testType, attemptId]
+      await attempt.update(
+        {
+          status: "submitted",
+          submitted_at: new Date(),
+          score,
+          graded_at: testType === "multiple_choice" ? new Date() : null,
+        },
+        { transaction: t },
       );
 
-      await client.query('COMMIT');
+      await t.commit();
 
       res.json({
-        message: testType === 'multiple_choice' ? 'Test submitted and graded' : 'Test submitted, awaiting manual grading',
+        message:
+          testType === "multiple_choice"
+            ? "Test submitted and graded"
+            : "Test submitted, awaiting manual grading",
         score: score ? parseFloat(score) : null,
-        needs_grading: testType !== 'multiple_choice'
+        needs_grading: testType !== "multiple_choice",
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Test submission error:', error);
-      res.status(500).json({ error: 'Failed to submit test' });
-    } finally {
-      client.release();
+      await t.rollback();
+      console.error("Test submission error:", error);
+      res.status(500).json({ error: "Failed to submit test" });
     }
-  }
+  },
 );
 
 // Grade test manually (Supervisor/Admin)
-router.post('/attempts/:attemptId/grade',
+router.post(
+  "/attempts/:attemptId/grade",
   authenticateToken,
-  authorize('supervisor', 'admin'),
-  [
-    body('answers').isArray({ min: 1 }),
-    body('feedback').optional().trim()
-  ],
+  authorize("supervisor", "admin"),
+  [body("answers").isArray({ min: 1 }), body("feedback").optional().trim()],
   async (req, res) => {
-    const client = await db.pool.connect();
+    const t = await sequelize.transaction();
     try {
-      await client.query('BEGIN');
-
       const attemptId = req.params.attemptId;
       const { answers, feedback } = req.body;
 
-      // Verify attempt exists
-      const attemptResult = await client.query(
-        'SELECT id, status FROM test_attempts WHERE id = $1',
-        [attemptId]
-      );
+      const attempt = await TestAttempt.findByPk(attemptId, {
+        attributes: ["id", "status"],
+        transaction: t,
+      });
 
-      if (attemptResult.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ error: 'Attempt not found' });
+      if (!attempt) {
+        await t.rollback();
+        return res.status(404).json({ error: "Attempt not found" });
       }
 
-      if (attemptResult.rows[0].status !== 'submitted') {
-        await client.query('ROLLBACK');
-        return res.status(400).json({ error: 'Test not in submitted state' });
+      if (attempt.status !== "submitted") {
+        await t.rollback();
+        return res.status(400).json({ error: "Test not in submitted state" });
       }
 
-      // Update answer scores
       let totalPoints = 0;
       let earnedPoints = 0;
 
       for (const answer of answers) {
-        const questionResult = await client.query(
-          'SELECT points FROM test_questions WHERE id = $1',
-          [answer.question_id]
-        );
+        const question = await TestQuestion.findByPk(answer.question_id, {
+          attributes: ["points"],
+          transaction: t,
+        });
 
-        totalPoints += questionResult.rows[0].points;
+        totalPoints += question.points;
         earnedPoints += answer.points_awarded || 0;
 
-        await client.query(
-          `UPDATE test_answers 
-           SET points_awarded = $1, feedback = $2
-           WHERE attempt_id = $3 AND question_id = $4`,
-          [answer.points_awarded, answer.feedback || null, attemptId, answer.question_id]
+        await TestAnswer.update(
+          {
+            points_awarded: answer.points_awarded,
+            feedback: answer.feedback || null,
+          },
+          {
+            where: { attempt_id: attemptId, question_id: answer.question_id },
+            transaction: t,
+          },
         );
       }
 
-      const score = (earnedPoints / totalPoints * 100).toFixed(2);
+      const score = ((earnedPoints / totalPoints) * 100).toFixed(2);
 
-      // Update attempt
-      await client.query(
-        `UPDATE test_attempts 
-         SET status = 'graded',
-             score = $1,
-             graded_at = CURRENT_TIMESTAMP,
-             graded_by = $2,
-             feedback = $3
-         WHERE id = $4`,
-        [score, req.user.id, feedback || null, attemptId]
+      await attempt.update(
+        {
+          status: "graded",
+          score,
+          graded_at: new Date(),
+          graded_by: req.user.id,
+          feedback: feedback || null,
+        },
+        { transaction: t },
       );
 
-      await client.query('COMMIT');
+      await t.commit();
 
       res.json({
-        message: 'Test graded successfully',
-        score: parseFloat(score)
+        message: "Test graded successfully",
+        score: parseFloat(score),
       });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Grading error:', error);
-      res.status(500).json({ error: 'Failed to grade test' });
-    } finally {
-      client.release();
+      await t.rollback();
+      console.error("Grading error:", error);
+      res.status(500).json({ error: "Failed to grade test" });
     }
-  }
+  },
 );
 
 // Get tests needing grading (Supervisor/Admin)
-router.get('/pending/grading', authenticateToken, authorize('supervisor', 'admin'), async (req, res) => {
-  try {
-    const result = await db.query(
-      `SELECT ta.id as attempt_id, ta.test_id, ta.user_id, ta.submitted_at,
+router.get(
+  "/pending/grading",
+  authenticateToken,
+  authorize("supervisor", "admin"),
+  async (req, res) => {
+    try {
+      const result = await sequelize.query(
+        `SELECT ta.id as attempt_id, ta.test_id, ta.user_id, ta.submitted_at,
               t.title as test_title, t.course_id,
               u.full_name as student_name,
               c.title as course_title
@@ -374,14 +418,16 @@ router.get('/pending/grading', authenticateToken, authorize('supervisor', 'admin
        JOIN users u ON ta.user_id = u.id
        JOIN courses c ON t.course_id = c.id
        WHERE ta.status = 'submitted' AND t.test_type != 'multiple_choice'
-       ORDER BY ta.submitted_at ASC`
-    );
+       ORDER BY ta.submitted_at ASC`,
+        { type: QueryTypes.SELECT },
+      );
 
-    res.json({ pending_tests: result.rows });
-  } catch (error) {
-    console.error('Pending tests error:', error);
-    res.status(500).json({ error: 'Failed to fetch pending tests' });
-  }
-});
+      res.json({ pending_tests: result });
+    } catch (error) {
+      console.error("Pending tests error:", error);
+      res.status(500).json({ error: "Failed to fetch pending tests" });
+    }
+  },
+);
 
 module.exports = router;

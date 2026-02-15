@@ -1,17 +1,26 @@
-const express = require('express');
-const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
-const { authenticateToken, authorize } = require('../middleware/auth');
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const {
+  sequelize,
+  MentorshipMessage,
+  Notification,
+  User,
+  Kudos,
+  Journal,
+} = require("../models");
+const { authenticateToken, authorize } = require("../middleware/auth");
+const { Op, QueryTypes } = require("sequelize");
 
 const router = express.Router();
 
 // Send mentorship message
-router.post('/messages',
+router.post(
+  "/messages",
   authenticateToken,
   [
-    body('receiver_id').isInt(),
-    body('message_text').trim().notEmpty(),
-    body('course_id').optional().isInt()
+    body("receiver_id").isInt(),
+    body("message_text").trim().notEmpty(),
+    body("course_id").optional().isInt(),
   ],
   async (req, res) => {
     try {
@@ -22,113 +31,120 @@ router.post('/messages',
 
       const { receiver_id, message_text, course_id } = req.body;
 
-      // Verify receiver exists
-      const receiverResult = await db.query(
-        'SELECT id, full_name FROM users WHERE id = $1',
-        [receiver_id]
-      );
-
-      if (receiverResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Receiver not found' });
+      const receiver = await User.findByPk(receiver_id, {
+        attributes: ["id", "full_name"],
+      });
+      if (!receiver) {
+        return res.status(404).json({ error: "Receiver not found" });
       }
 
-      // Insert message
-      const result = await db.query(
-        `INSERT INTO mentorship_messages (sender_id, receiver_id, message_text, course_id)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [req.user.id, receiver_id, message_text, course_id || null]
-      );
+      const msg = await MentorshipMessage.create({
+        sender_id: req.user.id,
+        receiver_id,
+        message_text,
+        course_id: course_id || null,
+      });
 
-      // Create notification for receiver
-      await db.query(
-        `INSERT INTO notifications (user_id, title, message, notification_type)
-         VALUES ($1, $2, $3, $4)`,
-        [receiver_id, 'New Message', `You have a new message from ${req.user.full_name}`, 'new_message']
-      );
+      await Notification.create({
+        user_id: receiver_id,
+        title: "New Message",
+        message: `You have a new message from ${req.user.full_name}`,
+        notification_type: "new_message",
+      });
 
       res.status(201).json({
-        message: 'Message sent successfully',
-        data: result.rows[0]
+        message: "Message sent successfully",
+        data: msg,
       });
     } catch (error) {
-      console.error('Message send error:', error);
-      res.status(500).json({ error: 'Failed to send message' });
+      console.error("Message send error:", error);
+      res.status(500).json({ error: "Failed to send message" });
     }
-  }
+  },
 );
 
 // Get messages (conversation)
-router.get('/messages', authenticateToken, async (req, res) => {
+router.get("/messages", authenticateToken, async (req, res) => {
   try {
     const { other_user_id, course_id } = req.query;
 
-    let query = `
-      SELECT m.*, 
-             us.full_name as sender_name,
-             ur.full_name as receiver_name
-      FROM mentorship_messages m
-      JOIN users us ON m.sender_id = us.id
-      JOIN users ur ON m.receiver_id = ur.id
-      WHERE (m.sender_id = $1 OR m.receiver_id = $1)
-    `;
-
-    const params = [req.user.id];
-    let paramIndex = 2;
+    const where = {
+      [Op.or]: [{ sender_id: req.user.id }, { receiver_id: req.user.id }],
+    };
 
     if (other_user_id) {
-      query += ` AND (m.sender_id = $${paramIndex} OR m.receiver_id = $${paramIndex})`;
-      params.push(other_user_id);
-      paramIndex++;
+      where[Op.and] = [
+        where[Op.or],
+        {
+          [Op.or]: [
+            { sender_id: other_user_id },
+            { receiver_id: other_user_id },
+          ],
+        },
+      ];
+      delete where[Op.or];
     }
 
     if (course_id) {
-      query += ` AND m.course_id = $${paramIndex}`;
-      params.push(course_id);
-      paramIndex++;
+      where.course_id = course_id;
     }
 
-    query += ' ORDER BY m.created_at DESC LIMIT 100';
-
-    const result = await db.query(query, params);
+    const messages = await MentorshipMessage.findAll({
+      where,
+      include: [
+        { model: User, as: "Sender", attributes: ["full_name"] },
+        { model: User, as: "Receiver", attributes: ["full_name"] },
+      ],
+      order: [["created_at", "DESC"]],
+      limit: 100,
+    });
 
     // Mark messages as read
     if (other_user_id) {
-      await db.query(
-        'UPDATE mentorship_messages SET is_read = true WHERE receiver_id = $1 AND sender_id = $2',
-        [req.user.id, other_user_id]
+      await MentorshipMessage.update(
+        { is_read: true },
+        { where: { receiver_id: req.user.id, sender_id: other_user_id } },
       );
     }
 
-    res.json({ messages: result.rows });
+    const result = messages.map((m) => {
+      const plain = m.get({ plain: true });
+      plain.sender_name = plain.Sender ? plain.Sender.full_name : null;
+      plain.receiver_name = plain.Receiver ? plain.Receiver.full_name : null;
+      delete plain.Sender;
+      delete plain.Receiver;
+      return plain;
+    });
+
+    res.json({ messages: result });
   } catch (error) {
-    console.error('Messages fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch messages' });
+    console.error("Messages fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch messages" });
   }
 });
 
 // Get unread message count
-router.get('/messages/unread/count', authenticateToken, async (req, res) => {
+router.get("/messages/unread/count", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
-      'SELECT COUNT(*) as count FROM mentorship_messages WHERE receiver_id = $1 AND is_read = false',
-      [req.user.id]
-    );
+    const count = await MentorshipMessage.count({
+      where: { receiver_id: req.user.id, is_read: false },
+    });
 
-    res.json({ unread_count: parseInt(result.rows[0].count) });
+    res.json({ unread_count: count });
   } catch (error) {
-    console.error('Unread count error:', error);
-    res.status(500).json({ error: 'Failed to fetch unread count' });
+    console.error("Unread count error:", error);
+    res.status(500).json({ error: "Failed to fetch unread count" });
   }
 });
 
 // Send kudos
-router.post('/kudos',
+router.post(
+  "/kudos",
   authenticateToken,
   [
-    body('to_user_id').isInt(),
-    body('points').isInt({ min: 1, max: 5 }),
-    body('message').trim().notEmpty()
+    body("to_user_id").isInt(),
+    body("points").isInt({ min: 1, max: 5 }),
+    body("message").trim().notEmpty(),
   ],
   async (req, res) => {
     try {
@@ -140,89 +156,97 @@ router.post('/kudos',
       const { to_user_id, points, message } = req.body;
 
       if (to_user_id === req.user.id) {
-        return res.status(400).json({ error: 'Cannot send kudos to yourself' });
+        return res.status(400).json({ error: "Cannot send kudos to yourself" });
       }
 
-      const result = await db.query(
-        `INSERT INTO kudos (from_user_id, to_user_id, points, message)
-         VALUES ($1, $2, $3, $4)
-         RETURNING *`,
-        [req.user.id, to_user_id, points, message]
-      );
+      const kudos = await Kudos.create({
+        from_user_id: req.user.id,
+        to_user_id,
+        points,
+        message,
+      });
 
-      // Create notification
-      await db.query(
-        `INSERT INTO notifications (user_id, title, message, notification_type)
-         VALUES ($1, $2, $3, $4)`,
-        [to_user_id, 'Kudos Received!', `${req.user.full_name} sent you ${points} kudos points!`, 'kudos']
-      );
+      await Notification.create({
+        user_id: to_user_id,
+        title: "Kudos Received!",
+        message: `${req.user.full_name} sent you ${points} kudos points!`,
+        notification_type: "kudos",
+      });
 
       res.status(201).json({
-        message: 'Kudos sent successfully',
-        kudos: result.rows[0]
+        message: "Kudos sent successfully",
+        kudos,
       });
     } catch (error) {
-      console.error('Kudos send error:', error);
-      res.status(500).json({ error: 'Failed to send kudos' });
+      console.error("Kudos send error:", error);
+      res.status(500).json({ error: "Failed to send kudos" });
     }
-  }
+  },
 );
 
 // Get kudos received
-router.get('/kudos/received', authenticateToken, async (req, res) => {
+router.get("/kudos/received", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
-      `SELECT k.*, u.full_name as from_user_name
-       FROM kudos k
-       JOIN users u ON k.from_user_id = u.id
-       WHERE k.to_user_id = $1
-       ORDER BY k.created_at DESC
-       LIMIT 50`,
-      [req.user.id]
-    );
+    const kudos = await Kudos.findAll({
+      where: { to_user_id: req.user.id },
+      include: [{ model: User, as: "FromUser", attributes: ["full_name"] }],
+      order: [["created_at", "DESC"]],
+      limit: 50,
+    });
 
-    const totalPoints = await db.query(
-      'SELECT SUM(points) as total FROM kudos WHERE to_user_id = $1',
-      [req.user.id]
-    );
+    const result = kudos.map((k) => {
+      const plain = k.get({ plain: true });
+      plain.from_user_name = plain.FromUser ? plain.FromUser.full_name : null;
+      delete plain.FromUser;
+      return plain;
+    });
+
+    const totalPoints = await Kudos.sum("points", {
+      where: { to_user_id: req.user.id },
+    });
 
     res.json({
-      kudos: result.rows,
-      total_points: parseInt(totalPoints.rows[0].total || 0)
+      kudos: result,
+      total_points: totalPoints || 0,
     });
   } catch (error) {
-    console.error('Kudos fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch kudos' });
+    console.error("Kudos fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch kudos" });
   }
 });
 
 // Get kudos given
-router.get('/kudos/given', authenticateToken, async (req, res) => {
+router.get("/kudos/given", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
-      `SELECT k.*, u.full_name as to_user_name
-       FROM kudos k
-       JOIN users u ON k.to_user_id = u.id
-       WHERE k.from_user_id = $1
-       ORDER BY k.created_at DESC
-       LIMIT 50`,
-      [req.user.id]
-    );
+    const kudos = await Kudos.findAll({
+      where: { from_user_id: req.user.id },
+      include: [{ model: User, as: "ToUser", attributes: ["full_name"] }],
+      order: [["created_at", "DESC"]],
+      limit: 50,
+    });
 
-    res.json({ kudos: result.rows });
+    const result = kudos.map((k) => {
+      const plain = k.get({ plain: true });
+      plain.to_user_name = plain.ToUser ? plain.ToUser.full_name : null;
+      delete plain.ToUser;
+      return plain;
+    });
+
+    res.json({ kudos: result });
   } catch (error) {
-    console.error('Kudos fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch kudos' });
+    console.error("Kudos fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch kudos" });
   }
 });
 
 // Create/Update journal entry
-router.post('/journal',
+router.post(
+  "/journal",
   authenticateToken,
-  authorize('learner'),
+  authorize("learner"),
   [
-    body('entry_text').trim().notEmpty(),
-    body('entry_date').optional().isDate()
+    body("entry_text").trim().notEmpty(),
+    body("entry_date").optional().isDate(),
   ],
   async (req, res) => {
     try {
@@ -232,108 +256,97 @@ router.post('/journal',
       }
 
       const { entry_text, entry_date } = req.body;
-      const date = entry_date || new Date().toISOString().split('T')[0];
+      const date = entry_date || new Date().toISOString().split("T")[0];
 
-      // Check if entry exists for this date
-      const existing = await db.query(
-        'SELECT id FROM journals WHERE user_id = $1 AND entry_date = $2',
-        [req.user.id, date]
-      );
+      const existing = await Journal.findOne({
+        where: { user_id: req.user.id, entry_date: date },
+      });
 
-      let result;
-      if (existing.rows.length > 0) {
-        // Update existing
-        result = await db.query(
-          `UPDATE journals 
-           SET entry_text = $1, updated_at = CURRENT_TIMESTAMP
-           WHERE id = $2
-           RETURNING *`,
-          [entry_text, existing.rows[0].id]
-        );
+      let entry;
+      if (existing) {
+        await existing.update({ entry_text, updated_at: new Date() });
+        entry = existing;
       } else {
-        // Create new
-        result = await db.query(
-          `INSERT INTO journals (user_id, entry_date, entry_text)
-           VALUES ($1, $2, $3)
-           RETURNING *`,
-          [req.user.id, date, entry_text]
-        );
+        entry = await Journal.create({
+          user_id: req.user.id,
+          entry_date: date,
+          entry_text,
+        });
       }
 
       res.json({
-        message: 'Journal entry saved successfully',
-        entry: result.rows[0]
+        message: "Journal entry saved successfully",
+        entry,
       });
     } catch (error) {
-      console.error('Journal save error:', error);
-      res.status(500).json({ error: 'Failed to save journal entry' });
+      console.error("Journal save error:", error);
+      res.status(500).json({ error: "Failed to save journal entry" });
     }
-  }
+  },
 );
 
 // Get journal entries
-router.get('/journal', authenticateToken, authorize('learner'), async (req, res) => {
-  try {
-    const { start_date, end_date, limit = 30 } = req.query;
+router.get(
+  "/journal",
+  authenticateToken,
+  authorize("learner"),
+  async (req, res) => {
+    try {
+      const { start_date, end_date, limit = 30 } = req.query;
 
-    let query = 'SELECT * FROM journals WHERE user_id = $1';
-    const params = [req.user.id];
-    let paramIndex = 2;
+      const where = { user_id: req.user.id };
 
-    if (start_date) {
-      query += ` AND entry_date >= $${paramIndex}`;
-      params.push(start_date);
-      paramIndex++;
+      if (start_date || end_date) {
+        where.entry_date = {};
+        if (start_date) where.entry_date[Op.gte] = start_date;
+        if (end_date) where.entry_date[Op.lte] = end_date;
+      }
+
+      const entries = await Journal.findAll({
+        where,
+        order: [["entry_date", "DESC"]],
+        limit: parseInt(limit),
+      });
+
+      res.json({ entries });
+    } catch (error) {
+      console.error("Journal fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch journal entries" });
     }
-
-    if (end_date) {
-      query += ` AND entry_date <= $${paramIndex}`;
-      params.push(end_date);
-      paramIndex++;
-    }
-
-    query += ` ORDER BY entry_date DESC LIMIT $${paramIndex}`;
-    params.push(limit);
-
-    const result = await db.query(query, params);
-
-    res.json({ entries: result.rows });
-  } catch (error) {
-    console.error('Journal fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch journal entries' });
-  }
-});
+  },
+);
 
 // Get conversation partners
-router.get('/conversations', authenticateToken, async (req, res) => {
+router.get("/conversations", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
+    // Complex query with CASE WHEN — use raw SQL
+    const result = await sequelize.query(
       `SELECT DISTINCT
          CASE 
-           WHEN m.sender_id = $1 THEN m.receiver_id
+           WHEN m.sender_id = :userId THEN m.receiver_id
            ELSE m.sender_id
          END as user_id,
          u.full_name,
          u.role,
          MAX(m.created_at) as last_message_time,
-         COUNT(CASE WHEN m.receiver_id = $1 AND m.is_read = false THEN 1 END) as unread_count
+         COUNT(CASE WHEN m.receiver_id = :userId AND m.is_read = false THEN 1 END) as unread_count
        FROM mentorship_messages m
        JOIN users u ON (
          CASE 
-           WHEN m.sender_id = $1 THEN m.receiver_id
+           WHEN m.sender_id = :userId THEN m.receiver_id
            ELSE m.sender_id
          END = u.id
        )
-       WHERE m.sender_id = $1 OR m.receiver_id = $1
+       WHERE m.sender_id = :userId OR m.receiver_id = :userId
        GROUP BY user_id, u.full_name, u.role
        ORDER BY last_message_time DESC`,
-      [req.user.id]
+      { replacements: { userId: req.user.id }, type: QueryTypes.SELECT },
     );
 
-    res.json({ conversations: result.rows });
+    res.json({ conversations: result });
   } catch (error) {
-    console.error('Conversations fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch conversations' });
+    console.error("Conversations fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch conversations" });
   }
 });
 

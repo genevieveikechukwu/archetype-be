@@ -1,43 +1,42 @@
-const fs = require('fs');
-const path = require('path');
-const { pool } = require('../config/database');
+const fs = require("fs");
+const path = require("path");
+const { sequelize } = require("../models");
 
 async function setupDatabase() {
-  const client = await pool.connect();
-  
   try {
-    console.log('🚀 Starting database setup...\n');
+    console.log("🚀 Starting database setup...\n");
 
-    // Read and execute schema file
-    const schemaPath = path.join(__dirname, '../schema.sql');
-    const schema = fs.readFileSync(schemaPath, 'utf8');
+    console.log("📋 Syncing database schema via Sequelize...");
+    await sequelize.sync({ force: true });
+    console.log("✅ Database schema created successfully!\n");
 
-    console.log('📋 Creating database schema...');
-    await client.query(schema);
-    console.log('✅ Database schema created successfully!\n');
-
-    // Create uploads directory
-    const uploadsDir = path.join(__dirname, '../uploads');
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-      console.log('📁 Created uploads directory\n');
+    // Create uploads directories
+    const dirs = [
+      path.join(__dirname, "../uploads"),
+      path.join(__dirname, "../uploads/assignments"),
+      path.join(__dirname, "../uploads/courses"),
+    ];
+    for (const dir of dirs) {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+        console.log(`📁 Created directory: ${dir}`);
+      }
     }
+    console.log("");
 
-    console.log('✅ Database setup complete!');
-    console.log('\nNext steps:');
-    console.log('1. Run: npm run seed (to add sample data)');
-    console.log('2. Run: npm start (to start the server)');
-    
+    console.log("✅ Database setup complete!");
+    console.log("\nNext steps:");
+    console.log("1. Run: npm run seed (to add sample data)");
+    console.log("2. Run: npm start (to start the server)");
   } catch (error) {
-    console.error('❌ Database setup failed:', error.message);
+    console.error("❌ Database setup failed:", error.message);
     throw error;
   } finally {
-    client.release();
-    await pool.end();
+    await sequelize.close();
   }
 }
 
-setupDatabase().catch(err => {
-  console.error('Fatal error:', err);
+setupDatabase().catch((err) => {
+  console.error("Fatal error:", err);
   process.exit(1);
 });

@@ -1,18 +1,17 @@
-const express = require('express');
-const { body, validationResult } = require('express-validator');
-const db = require('../config/database');
-const { authenticateToken, authorize } = require('../middleware/auth');
+const express = require("express");
+const { body, validationResult } = require("express-validator");
+const { sequelize, Skill, CourseSkill, UserSkill, User } = require("../models");
+const { authenticateToken, authorize } = require("../middleware/auth");
+const { QueryTypes, Op } = require("sequelize");
 
 const router = express.Router();
 
 // Create skill (Admin only)
-router.post('/',
+router.post(
+  "/",
   authenticateToken,
-  authorize('admin'),
-  [
-    body('name').trim().notEmpty(),
-    body('description').optional().trim()
-  ],
+  authorize("admin"),
+  [body("name").trim().notEmpty(), body("description").optional().trim()],
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -22,51 +21,53 @@ router.post('/',
 
       const { name, description } = req.body;
 
-      const result = await db.query(
-        'INSERT INTO skills (name, description) VALUES ($1, $2) RETURNING *',
-        [name, description || null]
-      );
+      const skill = await Skill.create({
+        name,
+        description: description || null,
+      });
 
       res.status(201).json({
-        message: 'Skill created successfully',
-        skill: result.rows[0]
+        message: "Skill created successfully",
+        skill,
       });
     } catch (error) {
-      if (error.code === '23505') {
-        return res.status(409).json({ error: 'Skill already exists' });
+      if (error.name === "SequelizeUniqueConstraintError") {
+        return res.status(409).json({ error: "Skill already exists" });
       }
-      console.error('Skill creation error:', error);
-      res.status(500).json({ error: 'Failed to create skill' });
+      console.error("Skill creation error:", error);
+      res.status(500).json({ error: "Failed to create skill" });
     }
-  }
+  },
 );
 
 // Get all skills
-router.get('/', authenticateToken, async (req, res) => {
+router.get("/", authenticateToken, async (req, res) => {
   try {
-    const result = await db.query(
+    const skills = await sequelize.query(
       `SELECT s.*, COUNT(cs.course_id) as course_count
        FROM skills s
        LEFT JOIN course_skills cs ON s.id = cs.skill_id
        GROUP BY s.id
-       ORDER BY s.name`
+       ORDER BY s.name`,
+      { type: QueryTypes.SELECT },
     );
 
-    res.json({ skills: result.rows });
+    res.json({ skills });
   } catch (error) {
-    console.error('Skills fetch error:', error);
-    res.status(500).json({ error: 'Failed to fetch skills' });
+    console.error("Skills fetch error:", error);
+    res.status(500).json({ error: "Failed to fetch skills" });
   }
 });
 
 // Link skill to course (Admin only)
-router.post('/course-link',
+router.post(
+  "/course-link",
   authenticateToken,
-  authorize('admin'),
+  authorize("admin"),
   [
-    body('course_id').isInt(),
-    body('skill_id').isInt(),
-    body('weight').optional().isFloat({ min: 0, max: 1 })
+    body("course_id").isInt(),
+    body("skill_id").isInt(),
+    body("weight").optional().isFloat({ min: 0, max: 1 }),
   ],
   async (req, res) => {
     try {
@@ -77,69 +78,68 @@ router.post('/course-link',
 
       const { course_id, skill_id, weight } = req.body;
 
-      const result = await db.query(
-        'INSERT INTO course_skills (course_id, skill_id, weight) VALUES ($1, $2, $3) RETURNING *',
-        [course_id, skill_id, weight || 1.0]
-      );
+      const link = await CourseSkill.create({
+        course_id,
+        skill_id,
+        weight: weight || 1.0,
+      });
 
       res.status(201).json({
-        message: 'Skill linked to course successfully',
-        link: result.rows[0]
+        message: "Skill linked to course successfully",
+        link,
       });
     } catch (error) {
-      if (error.code === '23505') {
-        return res.status(409).json({ error: 'Skill already linked to this course' });
+      if (error.name === "SequelizeUniqueConstraintError") {
+        return res
+          .status(409)
+          .json({ error: "Skill already linked to this course" });
       }
-      console.error('Skill link error:', error);
-      res.status(500).json({ error: 'Failed to link skill to course' });
+      console.error("Skill link error:", error);
+      res.status(500).json({ error: "Failed to link skill to course" });
     }
-  }
+  },
 );
 
 // Calculate and update user skills
-router.post('/calculate/:userId',
+router.post(
+  "/calculate/:userId",
   authenticateToken,
-  authorize('supervisor', 'admin'),
+  authorize("supervisor", "admin"),
   async (req, res) => {
-    const client = await db.pool.connect();
+    const t = await sequelize.transaction();
     try {
-      await client.query('BEGIN');
-
       const userId = req.params.userId;
 
       // Get all skills from completed courses
-      const skillsData = await client.query(
+      const skillsData = await sequelize.query(
         `SELECT cs.skill_id, cs.weight, c.id as course_id
          FROM enrollments e
          JOIN courses c ON e.course_id = c.id
          JOIN course_skills cs ON c.id = cs.course_id
-         WHERE e.user_id = $1 AND e.completed_at IS NOT NULL`,
-        [userId]
+         WHERE e.user_id = :userId AND e.completed_at IS NOT NULL`,
+        { replacements: { userId }, type: QueryTypes.SELECT, transaction: t },
       );
 
       // Get test averages per course
-      const testAverages = await client.query(
+      const testAverages = await sequelize.query(
         `SELECT t.course_id, AVG(ta.score) as avg_score
          FROM test_attempts ta
          JOIN tests t ON ta.test_id = t.id
-         WHERE ta.user_id = $1 AND ta.status = 'graded'
+         WHERE ta.user_id = :userId AND ta.status = 'graded'
          GROUP BY t.course_id`,
-        [userId]
+        { replacements: { userId }, type: QueryTypes.SELECT, transaction: t },
       );
 
       const testAvgMap = {};
-      testAverages.rows.forEach(row => {
+      testAverages.forEach((row) => {
         testAvgMap[row.course_id] = parseFloat(row.avg_score);
       });
 
       // Group by skill
       const skillMap = {};
-      skillsData.rows.forEach(row => {
+      skillsData.forEach((row) => {
         if (!skillMap[row.skill_id]) {
-          skillMap[row.skill_id] = {
-            courses: [],
-            weights: []
-          };
+          skillMap[row.skill_id] = { courses: [], weights: [] };
         }
         skillMap[row.skill_id].courses.push(row.course_id);
         skillMap[row.skill_id].weights.push(parseFloat(row.weight));
@@ -148,132 +148,138 @@ router.post('/calculate/:userId',
       // Calculate level for each skill
       for (const [skillId, data] of Object.entries(skillMap)) {
         const coursesCompleted = data.courses.length;
-        
-        // Calculate weighted test average
-        const testScores = data.courses.map(cid => testAvgMap[cid] || 0);
-        const testAverage = testScores.reduce((sum, score) => sum + score, 0) / testScores.length;
 
-        // Get supervisor rating (placeholder - would come from supervisor reviews)
+        const testScores = data.courses.map((cid) => testAvgMap[cid] || 0);
+        const testAverage =
+          testScores.reduce((sum, score) => sum + score, 0) / testScores.length;
+
         const supervisorRating = 3.5; // Default mid-range
 
-        // Formula: (courses_completed × test_avg × supervisor_rating) / 3
-        // Normalized to 0-5 scale
-        const rawScore = (coursesCompleted * (testAverage / 100) * supervisorRating) / 3;
-        const level = Math.min(5, rawScore * 5); // Scale to 0-5
+        const rawScore =
+          (coursesCompleted * (testAverage / 100) * supervisorRating) / 3;
+        const level = Math.min(5, rawScore * 5);
 
-        // Upsert user_skills
-        await client.query(
+        // Upsert user_skills using raw query for ON CONFLICT
+        await sequelize.query(
           `INSERT INTO user_skills (user_id, skill_id, level, courses_completed, test_average, supervisor_rating, last_calculated)
-           VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+           VALUES (:userId, :skillId, :level, :coursesCompleted, :testAverage, :supervisorRating, CURRENT_TIMESTAMP)
            ON CONFLICT (user_id, skill_id) 
            DO UPDATE SET 
-             level = $3,
-             courses_completed = $4,
-             test_average = $5,
-             supervisor_rating = $6,
+             level = :level,
+             courses_completed = :coursesCompleted,
+             test_average = :testAverage,
+             supervisor_rating = :supervisorRating,
              last_calculated = CURRENT_TIMESTAMP`,
-          [userId, skillId, level.toFixed(2), coursesCompleted, testAverage.toFixed(2), supervisorRating]
+          {
+            replacements: {
+              userId,
+              skillId,
+              level: level.toFixed(2),
+              coursesCompleted,
+              testAverage: testAverage.toFixed(2),
+              supervisorRating,
+            },
+            transaction: t,
+          },
         );
       }
 
-      await client.query('COMMIT');
+      await t.commit();
 
-      res.json({ message: 'Skills calculated successfully' });
+      res.json({ message: "Skills calculated successfully" });
     } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Skill calculation error:', error);
-      res.status(500).json({ error: 'Failed to calculate skills' });
-    } finally {
-      client.release();
+      await t.rollback();
+      console.error("Skill calculation error:", error);
+      res.status(500).json({ error: "Failed to calculate skills" });
     }
-  }
+  },
 );
 
 // Get user's skill profile
-router.get('/user/:userId', authenticateToken, async (req, res) => {
+router.get("/user/:userId", authenticateToken, async (req, res) => {
   try {
     const userId = req.params.userId;
 
-    const result = await db.query(
-      `SELECT us.*, s.name as skill_name, s.description as skill_description
-       FROM user_skills us
-       JOIN skills s ON us.skill_id = s.id
-       WHERE us.user_id = $1
-       ORDER BY us.level DESC`,
-      [userId]
-    );
+    const result = await UserSkill.findAll({
+      where: { user_id: userId },
+      include: [{ model: Skill, attributes: ["name", "description"] }],
+      order: [["level", "DESC"]],
+    });
 
-    const skillProfile = result.rows.map(row => ({
-      skill_id: row.skill_id,
-      skill_name: row.skill_name,
-      skill_description: row.skill_description,
-      level: parseFloat(row.level),
-      courses_completed: row.courses_completed,
-      test_average: parseFloat(row.test_average),
-      supervisor_rating: parseFloat(row.supervisor_rating),
-      last_calculated: row.last_calculated
-    }));
+    const skillProfile = result.map((row) => {
+      const plain = row.get({ plain: true });
+      return {
+        skill_id: plain.skill_id,
+        skill_name: plain.Skill ? plain.Skill.name : null,
+        skill_description: plain.Skill ? plain.Skill.description : null,
+        level: parseFloat(plain.level),
+        courses_completed: plain.courses_completed,
+        test_average: parseFloat(plain.test_average),
+        supervisor_rating: parseFloat(plain.supervisor_rating),
+        last_calculated: plain.last_calculated,
+      };
+    });
 
     res.json({ skill_profile: skillProfile });
   } catch (error) {
-    console.error('Skill profile error:', error);
-    res.status(500).json({ error: 'Failed to fetch skill profile' });
+    console.error("Skill profile error:", error);
+    res.status(500).json({ error: "Failed to fetch skill profile" });
   }
 });
 
 // Search users by skill
-router.get('/search',
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const { skill_name, min_level } = req.query;
+router.get("/search", authenticateToken, async (req, res) => {
+  try {
+    const { skill_name, min_level } = req.query;
 
-      if (!skill_name) {
-        return res.status(400).json({ error: 'skill_name parameter required' });
-      }
+    if (!skill_name) {
+      return res.status(400).json({ error: "skill_name parameter required" });
+    }
 
-      const result = await db.query(
-        `SELECT u.id, u.full_name, u.email, u.archetype, us.level, s.name as skill_name
+    const result = await sequelize.query(
+      `SELECT u.id, u.full_name, u.email, u.archetype, us.level, s.name as skill_name
          FROM user_skills us
          JOIN users u ON us.user_id = u.id
          JOIN skills s ON us.skill_id = s.id
-         WHERE s.name ILIKE $1 AND us.level >= $2 AND u.is_active = true
+         WHERE s.name ILIKE :skillName AND us.level >= :minLevel AND u.is_active = true
          ORDER BY us.level DESC`,
-        [`%${skill_name}%`, min_level || 0]
-      );
+      {
+        replacements: {
+          skillName: `%${skill_name}%`,
+          minLevel: min_level || 0,
+        },
+        type: QueryTypes.SELECT,
+      },
+    );
 
-      res.json({ users: result.rows });
-    } catch (error) {
-      console.error('Skill search error:', error);
-      res.status(500).json({ error: 'Failed to search by skill' });
-    }
+    res.json({ users: result });
+  } catch (error) {
+    console.error("Skill search error:", error);
+    res.status(500).json({ error: "Failed to search by skill" });
   }
-);
+});
 
 // Get skill graph data (for visualization)
-router.get('/graph/:userId', authenticateToken, async (req, res) => {
+router.get("/graph/:userId", authenticateToken, async (req, res) => {
   try {
     const userId = req.params.userId;
 
-    const result = await db.query(
-      `SELECT s.name, us.level
-       FROM user_skills us
-       JOIN skills s ON us.skill_id = s.id
-       WHERE us.user_id = $1
-       ORDER BY us.level DESC
-       LIMIT 10`,
-      [userId]
-    );
+    const result = await UserSkill.findAll({
+      where: { user_id: userId },
+      include: [{ model: Skill, attributes: ["name"] }],
+      order: [["level", "DESC"]],
+      limit: 10,
+    });
 
     res.json({
-      graph_data: result.rows.map(row => ({
-        skill: row.name,
-        level: parseFloat(row.level)
-      }))
+      graph_data: result.map((row) => ({
+        skill: row.Skill ? row.Skill.name : null,
+        level: parseFloat(row.level),
+      })),
     });
   } catch (error) {
-    console.error('Skill graph error:', error);
-    res.status(500).json({ error: 'Failed to generate skill graph' });
+    console.error("Skill graph error:", error);
+    res.status(500).json({ error: "Failed to generate skill graph" });
   }
 });
 
