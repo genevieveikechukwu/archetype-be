@@ -29,6 +29,7 @@ app.use(helmet()); // Security headers
 app.use(
   cors({
     origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   }),
 ); // Enable CORS
 app.use(morgan("combined")); // Logging
